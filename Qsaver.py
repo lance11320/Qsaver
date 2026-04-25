@@ -96,7 +96,7 @@ DEFAULT_LOCAL_MMPROJ = os.environ.get(
 )
 DEFAULT_LLAMA_SERVER_EXE = os.environ.get(
     "LLAMA_SERVER_EXE",
-    str(APP_DIR / "llama-server.exe") if (APP_DIR / "llama-server.exe").exists() else "llama-server.exe",
+    str(APP_DIR /"llama" / "llama-server.exe") if (APP_DIR / "llama" / "llama-server.exe").exists() else "llama-server.exe",
 )
 DEFAULT_LLAMA_CONTEXT = int(os.environ.get("LLAMA_CONTEXT", "4096"))
 DEFAULT_LLAMA_THREADS = max(1, min(os.cpu_count() or 8, 12))
@@ -1103,15 +1103,13 @@ def normalize_tags(tags: Any, category: str = "") -> List[str]:
     return out
 
 
-def format_remark(tags: List[str], explanation: str, solution_ocr: str, question_ocr: str, extra_note: str = "") -> str:
+def format_remark(tags: List[str], explanation: str,  extra_note: str = "") -> str:
     tag_line = " ".join(f"#{t}" for t in tags if t)
     blocks = []
     if tag_line:
         blocks.append(tag_line)
     if explanation.strip():
         blocks.append(explanation.strip())
-    if solution_ocr.strip():
-        blocks.append("[答案/解析OCR]\n" + solution_ocr.strip())
     if extra_note.strip():
         blocks.append("[人工补充]\n" + extra_note.strip())
     # Do not put question OCR in remark by default; it can be very long and duplicates stem/options.
@@ -1165,7 +1163,7 @@ def build_question_prompt(question_text: str) -> str:
     return f"""
 你将看到一道生物学选择/判断题的题干与选项，可能来自图片 OCR，也可能包含用户输入文字。
 请完成：
-1. 忠实提取题干 stem。
+1. 忠实提取题干 stem，去掉数字题号。
 2. 忠实提取选项 options，去掉 A/B/C/D 标号，只保留选项文本。
 3. 判断题目属于哪些生物学大类 category_tags。可从以下类别中选 1-3 个：{cats}。
 4. 如果图片中包含题目图表，请题干中保留“如图/下图”等语义，不要虚构图中不存在的结论。
@@ -1179,7 +1177,6 @@ JSON schema:
   "stem": "题干文本；不要包含选项",
   "options": ["选项A文本", "选项B文本", "选项C文本", "选项D文本"],
   "category_tags": ["细胞生物学"],
-  "question_ocr": "如果图片中有额外可见题目文字，在这里给出完整OCR；没有则为空字符串"
 }}
 """.strip()
 
@@ -1188,33 +1185,22 @@ def build_solution_prompt(solution_text: str, stem: str, options: List[str]) -> 
     cats = "、".join(BIOLOGY_CATEGORIES)
     options_text = "\n".join(f"{chr(65+i)}. {opt}" for i, opt in enumerate(options))
     return f"""
-你将看到答案/解析材料，可能是图片，也可能是用户输入文字。请结合已提取的题干和选项，提取答案与解析。
-
-已提取题干：
-{stem}
-
-已提取选项：
-{options_text if options_text else "无"}
+你将看到答案/解析材料图片，也可能有用户输入文字。请继续忠实提取答案与解析。
 
 用户补充的答案/解析文字：
 {solution_text.strip() if solution_text.strip() else "无"}
 
 要求：
-1. answer 字段：
-   - 如果题目是四个选项逐项判断正误，输出类似 "TFFF"、"TTFT" 的字符串。
-   - 如果题目是单选/多选，输出选项字母，如 "A"、"ACD"。
-   - 如果无法确定，输出空字符串。
-2. explanation 字段：提取或整理解析文字；不要凭空编写图中没有的信息。如果解析很短，也可只保留原文。
+1. answer 字段：忠实提取含T/F的字符串作为答案。如果用户输入了类似字段请使用用户输入。
+2. explanation 字段：忠实提取图片中所有的文字。
 3. category_tags 字段：从以下类别中选 1-3 个：{cats}。
-4. solution_ocr 字段：如果输入中有图片，请给出图片中的答案/解析文字 OCR；如果没有图片则为空字符串。
-5. 输出严格 JSON，不要输出解释、Markdown 或代码块。
+4. 输出严格 JSON，不要输出解释、Markdown 或代码块。
 
 JSON schema:
 {{
-  "answer": "",
+  "answer": "TFTT",
   "explanation": "",
   "category_tags": ["细胞生物学"],
-  "solution_ocr": ""
 }}
 """.strip()
 
@@ -1385,7 +1371,6 @@ def analyze_quiz(
     stem = str(q_obj.get("stem") or q_text or "").strip()
     options = normalize_options(q_obj.get("options", []))
     q_tags = normalize_tags(q_obj.get("category_tags", []))
-    q_ocr = str(q_obj.get("question_ocr") or "").strip()
 
     options_lines = "\n".join(options)
     status = "题干和选项提取完成。开始提取答案/解析并分类..."
@@ -1423,7 +1408,7 @@ def analyze_quiz(
         answer = str(s_obj.get("answer") or "").strip()
         explanation = str(s_obj.get("explanation") or s_text or "").strip()
         s_tags = normalize_tags(s_obj.get("category_tags", []))
-        s_ocr = str(s_obj.get("solution_ocr") or "").strip()
+
 
     tags = []
     for t in q_tags + s_tags:
@@ -1432,7 +1417,7 @@ def analyze_quiz(
     if not tags:
         tags = ["其他"]
 
-    remark = format_remark(tags=tags, explanation=explanation, solution_ocr=s_ocr, question_ocr=q_ocr)
+    remark = format_remark(tags=tags, explanation=explanation)
 
     final_q = {
         "stem": stem,
