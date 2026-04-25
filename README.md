@@ -7,7 +7,7 @@ Qwen3.5-0.8B-GGUF: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/tree/main; d
 
 llama-server: https://github.com/ggml-org/llama.cpp/releases; download and put them at the same folder with script.
 
--- main
+- main
    - qsaver.py
    - llama
    - models
