@@ -3,7 +3,7 @@ Qwen model based Quiz saver, OCR/split/save/export quiz. Now the script is for C
 
 Need llama-server.exe and model file.
 
-Qwen3.5-0.8B-GGUF: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/tree/main; download Qwen3.5-0.8B-UD-Q8_K_XL.gguf and mmproj.gguf and put them in ./models/
+Qwen3.5-0.8B-GGUF: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/tree/main; download Qwen3.5-0.8B-UD-Q8_K_XL.gguf and mmproj-F16.gguf and put them in ./models/
 
 llama-server: https://github.com/ggml-org/llama.cpp/releases; download and put them at the same folder with script.
 
@@ -12,4 +12,4 @@ llama-server: https://github.com/ggml-org/llama.cpp/releases; download and put t
    - llama
    - models
        - Qwen3.5-0.8B-UD-Q8_K_XL.gguf
-       - mmproj.gguf
+       - mmproj-F16.gguf
