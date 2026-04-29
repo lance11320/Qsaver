@@ -442,9 +442,191 @@ def save_backend_settings(
     return f"已保存到本地缓存：{CONFIG_FILE}"
 
 
+# =========================================================
+# API profile helpers
+# =========================================================
+
+def _mask_key(key: str) -> str:
+    key = (key or "").strip()
+    if not key:
+        return "no-key"
+    if len(key) <= 8:
+        return "*" * len(key)
+    return key[:4] + "..." + key[-4:]
+
+
+def _api_profile_label(profile: Dict[str, Any]) -> str:
+    name = str(profile.get("name") or "API profile").strip()
+    base = str(profile.get("base_url") or profile.get("effective_base_url") or "region-default").strip()
+    model = str(profile.get("model_name") or DEFAULT_API_MODEL_NAME).strip()
+    return f"{name} | {model} | {base}"
+
+
+def get_api_profiles(config: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    cfg = config if isinstance(config, dict) else load_backend_config()
+    profiles = cfg.get("api_profiles", [])
+    if not isinstance(profiles, list):
+        return []
+    return [p for p in profiles if isinstance(p, dict)]
+
+
+def api_profile_choices() -> List[str]:
+    return [_api_profile_label(p) for p in get_api_profiles()]
+
+
+def _profile_name_from_values(api_region: str, base_url: str, model_name: str) -> str:
+    effective = resolve_api_base_url(api_region, base_url)
+    try:
+        host = urlparse(effective).hostname or effective
+    except Exception:
+        host = effective
+    model = (model_name or DEFAULT_API_MODEL_NAME).strip()
+    return f"{host} / {model}"
+
+
+def upsert_api_profile(
+    api_region: str,
+    api_base_url: str,
+    api_model_name: str,
+    api_key: str,
+    save_api_key: bool = True,
+    profile_name: str = "",
+) -> Tuple[List[str], str]:
+    """Save or update a URL-key pair in qsaver_backend_config.json.
+
+    If api_base_url is blank, the profile records the selected region endpoint but
+    keeps the editable custom base_url blank so the default Aliyun/DashScope path
+    remains recoverable.
+    """
+    config = load_backend_config()
+    profiles = get_api_profiles(config)
+    api_region = api_region or DEFAULT_API_REGION
+    api_base_url = (api_base_url or "").strip().rstrip("/")
+    effective_base_url = resolve_api_base_url(api_region, api_base_url)
+    api_model_name = (api_model_name or DEFAULT_API_MODEL_NAME).strip()
+    api_key = (api_key or "").strip()
+    name = (profile_name or _profile_name_from_values(api_region, api_base_url, api_model_name)).strip()
+
+    found = False
+    for p in profiles:
+        if (
+            str(p.get("effective_base_url") or "").rstrip("/") == effective_base_url.rstrip("/")
+            and str(p.get("model_name") or "") == api_model_name
+        ):
+            p.update({
+                "name": name,
+                "region": api_region,
+                "base_url": api_base_url,
+                "effective_base_url": effective_base_url,
+                "model_name": api_model_name,
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            if save_api_key:
+                p["api_key"] = api_key
+            else:
+                p.pop("api_key", None)
+            found = True
+            break
+    if not found:
+        profile = {
+            "name": name,
+            "region": api_region,
+            "base_url": api_base_url,
+            "effective_base_url": effective_base_url,
+            "model_name": api_model_name,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if save_api_key:
+            profile["api_key"] = api_key
+        profiles.append(profile)
+
+    config["api_profiles"] = profiles
+    config.update({
+        "backend_mode": BACKEND_API,
+        "api_region": api_region,
+        "api_base_url": api_base_url,
+        "api_model_name": api_model_name,
+        "save_api_key": bool(save_api_key),
+    })
+    if save_api_key:
+        config["api_key"] = api_key
+    save_backend_config_dict(config)
+    return api_profile_choices(), f"已保存 API 配置：{name}\nURL={effective_base_url}\nmodel={api_model_name}\nkey={_mask_key(api_key)}"
+
+
+def load_api_profile(profile_label: str) -> Tuple[Any, str, str, str, bool, str]:
+    profiles = get_api_profiles()
+    if not profile_label:
+        return gr.update(value=None), "", DEFAULT_API_MODEL_NAME, "", True, "未选择 API profile。"
+    for p in profiles:
+        if _api_profile_label(p) == profile_label:
+            region = str(p.get("region") or DEFAULT_API_REGION)
+            base_url = str(p.get("base_url") or "")
+            model = str(p.get("model_name") or DEFAULT_API_MODEL_NAME)
+            key = str(p.get("api_key") or "")
+            return (
+                gr.update(value=region),
+                base_url,
+                model,
+                key,
+                bool(key),
+                f"已载入：{_api_profile_label(p)}\nkey={_mask_key(key)}",
+            )
+    return gr.update(value=DEFAULT_API_REGION), "", DEFAULT_API_MODEL_NAME, "", True, "没有找到该 API profile，可能缓存已变更。"
+
+
+def delete_api_profile(profile_label: str) -> Tuple[Any, str]:
+    config = load_backend_config()
+    profiles = get_api_profiles(config)
+    before = len(profiles)
+    profiles = [p for p in profiles if _api_profile_label(p) != profile_label]
+    config["api_profiles"] = profiles
+    save_backend_config_dict(config)
+    choices = api_profile_choices()
+    return gr.update(choices=choices, value=None), f"已删除 {before - len(profiles)} 个 API profile。"
+
+
+def test_api_and_save_profile(
+    api_region: str,
+    api_base_url: str,
+    api_model_name: str,
+    api_key: str,
+    save_api_key: bool,
+) -> Tuple[Any, str]:
+    """Run a minimal OpenAI-compatible request; save the URL-key pair only if it succeeds."""
+    effective_url = resolve_api_base_url(api_region, api_base_url)
+    key = (api_key or os.getenv("DASHSCOPE_API_KEY", "")).strip()
+    if not key:
+        return gr.update(choices=api_profile_choices()), "测试失败：API key 为空。"
+    try:
+        text = run_vl_once(
+            server_url=effective_url,
+            model_name=(api_model_name or DEFAULT_API_MODEL_NAME).strip(),
+            api_key=key,
+            prompt="请只回复 OK。",
+            images=[],
+            system_prompt="你是一个连通性测试助手。",
+            max_new_tokens=32,
+            temperature=0.0,
+            top_p=1.0,
+        )
+    except Exception as e:
+        return gr.update(choices=api_profile_choices()), f"测试失败，不保存：{type(e).__name__}: {e}"
+    choices, msg = upsert_api_profile(
+        api_region=api_region,
+        api_base_url=api_base_url,
+        api_model_name=api_model_name,
+        api_key=key,
+        save_api_key=save_api_key,
+    )
+    return gr.update(choices=choices, value=choices[-1] if choices else None), f"测试通过，已保存。模型回复：{text[:200]}\n\n{msg}"
+
+
 BACKEND_CONFIG = load_backend_config()
 LOCAL_MODEL_CHOICES = list_local_gguf_models()
 LOCAL_MMPROJ_CHOICES = list_local_mmproj_files()
+API_PROFILE_CHOICES = api_profile_choices()
 
 # =========================================================
 # llama-server helpers
@@ -1366,6 +1548,17 @@ def analyze_quiz(
         yield "调用后端失败：题干/选项提取未完成。", "", "", "", "", "", image_rel, err, {"error": str(e)}, None
         return
     q_elapsed = time.perf_counter() - t_q0
+    if backend_mode == BACKEND_API:
+        try:
+            upsert_api_profile(
+                api_region=api_region,
+                api_base_url=api_base_url,
+                api_model_name=api_model_name,
+                api_key=effective_api_key,
+                save_api_key=bool(save_api_key),
+            )
+        except Exception:
+            pass
     q_obj = extract_json_object(raw_q)
 
     stem = str(q_obj.get("stem") or q_text or "").strip()
@@ -1739,9 +1932,459 @@ def show_entry_view():
     return gr.update(visible=True), gr.update(visible=False), "当前视图：AI 录入。切换动作不读取题库、不调用模型。"
 
 
+
+def show_entry_view():
+    """Switch view without loading database or model."""
+    return (
+        gr.update(visible=True),
+        gr.update(visible=False),
+        gr.update(visible=False),
+        "当前视图：AI 录入。题库表格只在点击 Search / Reload 后加载。",
+    )
+
+
 def show_db_view():
     """Switch view without loading database or model."""
-    return gr.update(visible=False), gr.update(visible=True), "当前视图：题库浏览与导出。点击 Search / Reload 后才加载表格。"
+    return (
+        gr.update(visible=False),
+        gr.update(visible=True),
+        gr.update(visible=False),
+        "当前视图：题库浏览与导出。点击 Search / Reload 后才加载表格。",
+    )
+
+
+def show_ai_select_view():
+    """Switch to AI-assisted selection view."""
+    return (
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=True),
+        "当前视图：AI 辅助选题。AI 只拆解 AND/OR 关键词逻辑树和数量，固定程序负责检索与选定。",
+    )
+
+
+# =========================================================
+# AI-assisted question selection
+# =========================================================
+
+
+def build_ai_selection_prompt(user_request: str, default_count: int, compact: bool = False) -> str:
+    """Prompt the model to output a small boolean query tree instead of flat keyword lists."""
+    default_count = int(default_count or 50)
+    examples = """
+示例1：用户：脊椎动物 骨骼 皮肤，50题
+输出：{"count":50,"query":{"op":"AND","clauses":[{"name":"主题范围","op":"OR","keywords":["脊椎动物","脊索动物","鱼类","两栖","爬行","鸟类","哺乳"]},{"name":"考查模块","op":"OR","keywords":["骨骼","皮肤"]}]},"exclude_keywords":[],"notes":"脊椎动物是上位主题；骨骼和皮肤是同级模块，二者为 OR。"}
+示例2：用户：同时涉及骨骼和皮肤的脊椎动物题目
+输出：{"count":%d,"query":{"op":"AND","clauses":[{"name":"主题范围","op":"OR","keywords":["脊椎动物","脊索动物","鱼类","两栖","爬行","鸟类","哺乳"]},{"name":"骨骼","op":"OR","keywords":["骨骼"]},{"name":"皮肤","op":"OR","keywords":["皮肤"]}]},"exclude_keywords":[],"notes":"用户明确要求同时涉及骨骼和皮肤，因此两个模块用 AND。"}
+示例3：用户：鱼类或两栖类的呼吸系统题
+输出：{"count":%d,"query":{"op":"AND","clauses":[{"name":"动物类群","op":"OR","keywords":["鱼类","两栖"]},{"name":"考查模块","op":"OR","keywords":["呼吸"]}]},"exclude_keywords":[],"notes":"鱼类和两栖类是并列类群；呼吸系统是限定模块。"}
+""" % (default_count, default_count)
+    if compact:
+        return f"""
+只输出严格 JSON。不要解释。任务：把组卷需求转成布尔关键词树，程序会按树检索题库。
+规则：上位主题 AND 子模块；同级候选词 OR；“同时/都涉及/并且”才用 AND；“或/或者/、/和”列举同级模块通常 OR；“不要/排除”放 exclude_keywords。
+常用扩展：脊椎动物=>[脊椎动物,脊索动物,鱼类,两栖,爬行,鸟类,哺乳]。
+JSON格式：{{"count":{default_count},"query":{{"op":"AND","clauses":[{{"name":"主题范围","op":"OR","keywords":[]}},{{"name":"考查模块","op":"OR","keywords":[]}}]}},"exclude_keywords":[],"notes":""}}
+{examples}
+用户需求：{user_request.strip() if user_request.strip() else '选择一套生物题'}
+""".strip()
+    return f"""
+你是题库检索需求拆解助手。你不选题、不解题、不改写题目，只把用户需求转换为固定程序可执行的布尔关键词树。
+
+输出必须是严格 JSON，不要 Markdown，不要额外解释。
+
+核心原则：
+1. count：用户明确题数就用用户题数，否则用默认题数 {default_count}。
+2. query：用布尔树表达检索关系。节点格式为 {{"name":"...","op":"AND或OR","keywords":[...],"clauses":[...]}}。
+3. 上位主题与下位模块通常是 AND。例如“脊椎动物 骨骼 皮肤”= 脊椎动物相关 AND (骨骼 OR 皮肤)。
+4. 同级类群/同级模块通常是 OR。例如“骨骼 皮肤”是两个同级模块；“鱼类 两栖”是两个同级类群。
+5. 用户明确说“同时涉及、都涉及、并且、既...又...”时，同级模块可以改成 AND。
+6. 宽泛主题要扩展成题库可能出现的短词。例如“脊椎动物学”扩展为“脊椎动物、脊索动物、鱼类、两栖、爬行、鸟类、哺乳、比较解剖”。
+7. exclude_keywords：只放用户明确排除的内容。
+8. 关键词必须短，尽量是题干/remark 中可能出现的中文词，不要长句。
+9. 不要输出 must_keywords / any_keywords；只输出 query 逻辑树。
+
+JSON schema：
+{{
+  "count": 50,
+  "query": {{
+    "op": "AND",
+    "clauses": [
+      {{"name": "主题范围", "op": "OR", "keywords": []}},
+      {{"name": "考查模块", "op": "OR", "keywords": []}}
+    ]
+  }},
+  "exclude_keywords": [],
+  "notes": "一句话说明 AND/OR 拆解逻辑"
+}}
+
+{examples}
+用户需求：
+{user_request.strip() if user_request.strip() else '选择一套生物题'}
+""".strip()
+
+
+def normalize_keyword_list(value: Any) -> List[str]:
+    if isinstance(value, str):
+        parts = re.split(r"[\s,，;；、/|]+", value)
+    elif isinstance(value, list):
+        parts = [str(x) for x in value]
+    else:
+        parts = []
+    out: List[str] = []
+    for x in parts:
+        x = normalize_search_text(x).strip()
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+VERTEBRATE_TERMS = ["脊椎动物", "脊索动物", "鱼类", "两栖", "爬行", "鸟类", "哺乳", "比较解剖"]
+MODULE_TERMS = [
+    "骨骼", "皮肤", "循环", "呼吸", "排泄", "神经", "发育", "胚胎", "进化",
+    "牙齿", "肌肉", "消化", "生殖", "免疫", "内分泌", "感觉", "运动", "器官系统",
+]
+TAXON_TERMS = ["鱼类", "两栖", "爬行", "鸟类", "哺乳", "哺乳类", "爬行类", "两栖类", "软骨鱼", "硬骨鱼"]
+
+
+def make_query_leaf(name: str, op: str, keywords: List[str]) -> Dict[str, Any]:
+    return {"name": name, "op": op.upper(), "keywords": normalize_keyword_list(keywords)}
+
+
+def fallback_parse_selection_request(user_request: str, default_count: int) -> Dict[str, Any]:
+    """Rule-based fallback when the small local model fails to return valid JSON."""
+    text = user_request or ""
+    m = re.search(r"(\d+)\s*[道题題个個]?", text)
+    count = int(m.group(1)) if m else int(default_count or 50)
+
+    exclude_keywords: List[str] = []
+    for pat in [r"(?:不要|排除|不含|不包括)([^，,。；;]+)", r"(?:避免)([^，,。；;]+)"]:
+        for hit in re.findall(pat, text):
+            exclude_keywords.extend(normalize_keyword_list(hit))
+
+    clauses: List[Dict[str, Any]] = []
+    if any(t in text for t in ["脊椎", "脊索", "鱼", "两栖", "爬行", "鸟", "哺乳"]):
+        topic_terms = VERTEBRATE_TERMS if any(t in text for t in ["脊椎", "脊索"]) else []
+        taxa = [t for t in TAXON_TERMS if t in text]
+        if taxa:
+            topic_terms = taxa
+        clauses.append(make_query_leaf("主题范围", "OR", topic_terms or VERTEBRATE_TERMS))
+
+    module_hits = [t for t in MODULE_TERMS if t in text]
+    if module_hits:
+        if re.search(r"同时|都涉及|并且|既.*又", text) and len(module_hits) >= 2:
+            for t in module_hits:
+                clauses.append(make_query_leaf(t, "OR", [t]))
+        else:
+            clauses.append(make_query_leaf("考查模块", "OR", module_hits))
+
+    if not clauses:
+        tokens, _ = split_search_query(text)
+        tokens = [t for t in tokens if not re.fullmatch(r"\d+", t)]
+        clauses.append(make_query_leaf("用户关键词", "OR", tokens or [text.strip() or "生物"]))
+
+    return {
+        "count": count,
+        "query": {"op": "AND", "clauses": clauses},
+        "exclude_keywords": exclude_keywords,
+        "notes": "AI 拆解失败或未返回合法 JSON，已使用规则兜底。",
+    }
+
+
+def sanitize_query_node(node: Any) -> Dict[str, Any]:
+    """Normalize a model-produced query tree into a safe internal representation."""
+    if not isinstance(node, dict):
+        return {"op": "OR", "keywords": normalize_keyword_list(node)}
+    op = str(node.get("op") or "OR").upper()
+    if op not in {"AND", "OR"}:
+        op = "OR"
+    name = str(node.get("name") or "").strip()
+    keywords = normalize_keyword_list(node.get("keywords", []))
+    raw_clauses = node.get("clauses", [])
+    clauses: List[Dict[str, Any]] = []
+    if isinstance(raw_clauses, list):
+        for child in raw_clauses:
+            clean_child = sanitize_query_node(child)
+            if clean_child.get("keywords") or clean_child.get("clauses"):
+                clauses.append(clean_child)
+    return {"name": name, "op": op, "keywords": keywords, "clauses": clauses}
+
+
+def legacy_keywords_to_query(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """Backward compatibility for older model output with must_keywords/any_keywords."""
+    must_keywords = normalize_keyword_list(parsed.get("must_keywords", []))
+    any_keywords = normalize_keyword_list(parsed.get("any_keywords", []))
+    clauses: List[Dict[str, Any]] = []
+    for kw in must_keywords:
+        clauses.append(make_query_leaf(kw, "OR", [kw]))
+    if any_keywords:
+        clauses.append(make_query_leaf("扩展关键词", "OR", any_keywords))
+    if not clauses:
+        clauses.append(make_query_leaf("全部题目", "OR", []))
+    return {"op": "AND", "clauses": clauses}
+
+
+def ensure_query_plan(parsed: Dict[str, Any], user_request: str, default_count: int) -> Dict[str, Any]:
+    """Return a valid {count, query, exclude_keywords, notes} plan."""
+    if not isinstance(parsed, dict) or not parsed:
+        return fallback_parse_selection_request(user_request, default_count)
+    count = int(parsed.get("count") or default_count or 50)
+    if isinstance(parsed.get("query"), dict):
+        query = sanitize_query_node(parsed.get("query"))
+    elif "must_keywords" in parsed or "any_keywords" in parsed:
+        query = sanitize_query_node(legacy_keywords_to_query(parsed))
+    else:
+        return fallback_parse_selection_request(user_request, default_count)
+    if not query.get("keywords") and not query.get("clauses"):
+        return fallback_parse_selection_request(user_request, default_count)
+    return {
+        "count": count,
+        "query": query,
+        "exclude_keywords": normalize_keyword_list(parsed.get("exclude_keywords", [])),
+        "notes": str(parsed.get("notes") or "").strip(),
+    }
+
+
+def evaluate_query_node(node: Dict[str, Any], corpus: str) -> bool:
+    op = str(node.get("op") or "OR").upper()
+    keywords = normalize_keyword_list(node.get("keywords", []))
+    clauses = node.get("clauses", []) if isinstance(node.get("clauses", []), list) else []
+    results: List[bool] = []
+    if keywords:
+        if op == "AND":
+            results.append(all(k in corpus for k in keywords))
+        else:
+            results.append(any(k in corpus for k in keywords))
+    for child in clauses:
+        if isinstance(child, dict):
+            results.append(evaluate_query_node(child, corpus))
+    if not results:
+        return True
+    return all(results) if op == "AND" else any(results)
+
+
+def flatten_query_keywords(node: Dict[str, Any], depth: int = 0) -> List[Tuple[str, int]]:
+    out: List[Tuple[str, int]] = []
+    for kw in normalize_keyword_list(node.get("keywords", [])):
+        out.append((kw, depth))
+    clauses = node.get("clauses", []) if isinstance(node.get("clauses", []), list) else []
+    for child in clauses:
+        if isinstance(child, dict):
+            out.extend(flatten_query_keywords(child, depth + 1))
+    return out
+
+
+def query_tree_to_text(node: Dict[str, Any]) -> str:
+    op = str(node.get("op") or "OR").upper()
+    name = str(node.get("name") or "").strip()
+    keywords = normalize_keyword_list(node.get("keywords", []))
+    parts: List[str] = []
+    if keywords:
+        joiner = f" {op} "
+        parts.append("(" + joiner.join(keywords) + ")" if len(keywords) > 1 else keywords[0])
+    clauses = node.get("clauses", []) if isinstance(node.get("clauses", []), list) else []
+    for child in clauses:
+        if isinstance(child, dict):
+            parts.append(query_tree_to_text(child))
+    if not parts:
+        expr = "ALL"
+    elif len(parts) == 1:
+        expr = parts[0]
+    else:
+        expr = "(" + f" {op} ".join(parts) + ")"
+    return f"{name}:{expr}" if name else expr
+
+
+def select_question_indices_by_query_tree(
+    query: Dict[str, Any],
+    exclude_keywords: List[str],
+    count: int,
+) -> Tuple[List[int], List[List[Any]], str]:
+    all_data = load_data()
+    count = max(1, int(count or 50))
+    query = sanitize_query_node(query)
+    exclude_keywords = normalize_keyword_list(exclude_keywords)
+    flat_keywords = flatten_query_keywords(query)
+
+    scored: List[Tuple[int, int, Dict[str, Any]]] = []
+    for idx, q in enumerate(all_data):
+        corpus = question_search_corpus(q)
+        if exclude_keywords and any(k in corpus for k in exclude_keywords):
+            continue
+        if not evaluate_query_node(query, corpus):
+            continue
+        score = 0
+        for kw, depth in flat_keywords:
+            if kw in corpus:
+                score += max(8, 40 - depth * 6)
+        if "脊椎动物学" in corpus:
+            score += 30
+        if "文献题" in corpus or "图表题" in corpus:
+            score += 5
+        scored.append((score, idx, q))
+
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    indices = [idx for _, idx, _ in scored[:count]]
+    rows = question_rows_from_indices(indices)
+    status = (
+        f"逻辑树检索完成：选中 {len(indices)} / 目标 {count} / 题库总计 {len(all_data)}。\n"
+        f"query={query_tree_to_text(query)}\n"
+        f"exclude={exclude_keywords or '无'}"
+    )
+    return indices, rows, status
+
+
+# Backward-compatible wrapper. Kept in case other UI callbacks still call the old function name.
+def select_question_indices_by_keywords(
+    must_keywords: List[str],
+    any_keywords: List[str],
+    exclude_keywords: List[str],
+    count: int,
+) -> Tuple[List[int], List[List[Any]], str]:
+    clauses: List[Dict[str, Any]] = []
+    for kw in normalize_keyword_list(must_keywords):
+        clauses.append(make_query_leaf(kw, "OR", [kw]))
+    any_keywords = normalize_keyword_list(any_keywords)
+    if any_keywords:
+        clauses.append(make_query_leaf("扩展关键词", "OR", any_keywords))
+    query = {"op": "AND", "clauses": clauses or [make_query_leaf("全部题目", "OR", [])]}
+    return select_question_indices_by_query_tree(query, exclude_keywords, count)
+
+
+def ai_plan_and_select_questions(
+    user_request: str,
+    default_count: int,
+    backend_mode: str,
+    api_region: str,
+    api_base_url: str,
+    api_model_name: str,
+    api_key: str,
+    server_url: str,
+    model_name: str,
+    llama_server_exe: str,
+    local_model_path: str,
+    local_mmproj_path: str,
+    llama_ctx_size: int,
+    llama_threads: int,
+    system_prompt: str,
+    temperature: float,
+    top_p: float,
+) -> Tuple[str, Dict[str, Any], str, List[List[Any]], List[int], Any, List[str]]:
+    """Use AI only to decompose the selection request; deterministic code performs retrieval.
+
+    Returns current AI candidates plus CheckboxGroup choices so the user can
+    discard items before merging selected candidates into a persistent total pool.
+    """
+    user_request = (user_request or "").strip()
+    if not user_request:
+        return "请先输入选题需求。", {}, "", [], [], gr.update(choices=[], value=[]), []
+
+    backend_mode = backend_mode or BACKEND_LOCAL
+    raw = ""
+    parsed: Dict[str, Any] = {}
+    try:
+        if backend_mode == BACKEND_API:
+            effective_server_url = resolve_api_base_url(api_region, api_base_url)
+            effective_model_name = (api_model_name or DEFAULT_API_MODEL_NAME).strip()
+            effective_api_key = (api_key or os.getenv("DASHSCOPE_API_KEY", "")).strip()
+            if not effective_api_key:
+                raise RuntimeError("远程 API 模式需要 API key。")
+            compact_prompt = False
+        else:
+            effective_server_url = server_url
+            effective_model_name = (model_name or local_model_name_from_path(local_model_path)).strip()
+            effective_api_key = ""
+            compact_prompt = True
+            ok, msg = ensure_llama_server_running(
+                llama_server_exe=llama_server_exe,
+                model_path=local_model_path,
+                mmproj_path=local_mmproj_path,
+                server_url=server_url,
+                ctx_size=int(llama_ctx_size or DEFAULT_LLAMA_CONTEXT),
+                threads=int(llama_threads or DEFAULT_LLAMA_THREADS),
+                api_key="",
+            )
+            if not ok:
+                raise RuntimeError(msg)
+
+        raw = run_vl_once(
+            server_url=effective_server_url,
+            model_name=effective_model_name,
+            api_key=effective_api_key,
+            prompt=build_ai_selection_prompt(user_request, int(default_count or 50), compact=compact_prompt),
+            images=[],
+            system_prompt="只输出严格 JSON，不要输出解释或 Markdown。",
+            max_new_tokens=640 if compact_prompt else 1024,
+            temperature=0.0,
+            top_p=1.0,
+        )
+        parsed = extract_json_object(raw)
+        if not parsed:
+            parsed = fallback_parse_selection_request(user_request, int(default_count or 50))
+            raw = raw + "\n\n[Fallback]\n模型未返回合法 JSON，已使用规则兜底。"
+    except Exception as e:
+        parsed = fallback_parse_selection_request(user_request, int(default_count or 50))
+        raw = f"[AI planning failed]\n{type(e).__name__}: {e}\n\n[Fallback]\n已使用规则兜底。"
+
+    plan = ensure_query_plan(parsed, user_request, int(default_count or 50))
+    count = int(plan.get("count") or default_count or 50)
+    query = sanitize_query_node(plan.get("query", {}))
+    exclude_keywords = normalize_keyword_list(plan.get("exclude_keywords", []))
+
+    indices, rows, select_status = select_question_indices_by_query_tree(
+        query=query,
+        exclude_keywords=exclude_keywords,
+        count=count,
+    )
+    plan_summary = json.dumps({
+        "count": count,
+        "query": query,
+        "query_text": query_tree_to_text(query),
+        "exclude_keywords": exclude_keywords,
+        "notes": plan.get("notes", ""),
+    }, ensure_ascii=False, indent=2)
+    current_choices = remove_choices_from_indices(indices)
+    status = (
+        "AI 已完成 AND/OR 逻辑树拆解，固定程序已按逻辑树检索候选题。\n"
+        + select_status
+        + "\n请在 AI current candidates 中取消不想保留的题目，再点击 Add checked to total pool。"
+    )
+    return (
+        status,
+        plan,
+        raw + "\n\n[Query plan]\n" + plan_summary,
+        rows,
+        indices,
+        gr.update(choices=current_choices, value=current_choices),
+        current_choices,
+    )
+
+
+def discard_current_ai_candidates():
+    """Clear the current AI candidate batch without touching the persistent total pool."""
+    return (
+        [],
+        [],
+        gr.update(choices=[], value=[]),
+        [],
+        "已丢弃当前 AI 候选批次；总备选池未改变。",
+    )
+
+
+def add_current_ai_checked_to_pool(checked_labels: List[str], pool_indices: Optional[List[int]]):
+    """Merge checked AI candidates into the persistent total pool."""
+    return add_checked_to_selection(checked_labels, pool_indices)
+
+
+def remove_checked_from_ai_pool(remove_labels: List[str], pool_indices: Optional[List[int]]):
+    """Remove checked questions from the persistent AI total pool."""
+    return remove_checked_from_selection(remove_labels, pool_indices)
+
+
+def clear_ai_pool():
+    """Clear persistent AI total pool."""
+    return clear_selection()
+
 
 # =========================================================
 # UI
@@ -1766,7 +2409,7 @@ CUSTOM_CSS = CUSTOM_CSS + """
   border-radius: 18px;
   background: #ffffff;
 }
-#entry-view, #db-view { width: 100%; }
+#entry-view, #db-view, #ai-select-view { width: 100%; }
 #db-panel {
   border: 1px solid #e6e8ef;
   border-radius: 22px;
@@ -1792,6 +2435,7 @@ with gr.Blocks(title="Local Qwen-VL Quiz Builder - llama-server checked") as dem
     with gr.Row(elem_id="view-nav"):
         nav_entry_btn = gr.Button("AI 录入", variant="primary", scale=1)
         nav_db_btn = gr.Button("题库浏览与导出", variant="secondary", scale=1)
+        nav_ai_select_btn = gr.Button("AI 辅助选题", variant="secondary", scale=1)
         nav_status = gr.Textbox(
             value="当前视图：AI 录入。题库表格只在点击 Search / Reload 后加载。",
             interactive=False,
@@ -1926,6 +2570,15 @@ with gr.Blocks(title="Local Qwen-VL Quiz Builder - llama-server checked") as dem
 
                 with gr.Group(visible=(config_get(BACKEND_CONFIG, "backend_mode", BACKEND_LOCAL) == BACKEND_API)) as api_backend_group:
                     gr.Markdown("### 远程 OpenAI-compatible API")
+                    api_profile_dropdown = gr.Dropdown(
+                        label="已保存 API profile；选择后点击 Load",
+                        choices=API_PROFILE_CHOICES,
+                        value=None,
+                        interactive=True,
+                    )
+                    with gr.Row():
+                        load_api_profile_btn = gr.Button("Load selected API profile")
+                        delete_api_profile_btn = gr.Button("Delete selected API profile")
                     api_region = gr.Dropdown(
                         label="API region endpoint",
                         choices=list(REGION_BASE_URLS.keys()),
@@ -1950,8 +2603,10 @@ with gr.Blocks(title="Local Qwen-VL Quiz Builder - llama-server checked") as dem
                         label="Save API key to local cache",
                         value=bool(config_get(BACKEND_CONFIG, "save_api_key", True)),
                     )
-                    save_backend_btn = gr.Button("Save backend/API settings")
-                    api_cache_status = gr.Textbox(label="API/cache status", lines=3, interactive=False)
+                    with gr.Row():
+                        save_backend_btn = gr.Button("Save backend/API settings")
+                        test_save_api_profile_btn = gr.Button("Test API and save URL-key profile", variant="primary")
+                    api_cache_status = gr.Textbox(label="API/cache status", lines=4, interactive=False)
 
                 system_prompt = gr.Textbox(label="System prompt", value=DEFAULT_SYSTEM_PROMPT, lines=8)
                 with gr.Row():
@@ -2023,23 +2678,126 @@ with gr.Blocks(title="Local Qwen-VL Quiz Builder - llama-server checked") as dem
                 export_status = gr.Textbox(label="Export status", interactive=False, scale=3)
                 export_file = gr.File(label="Exported Word file", scale=2)
 
+    with gr.Column(elem_id="ai-select-view", visible=False) as ai_select_view:
+        # Current batch = the latest AI retrieval result. Total pool = manually curated across multiple AI runs.
+        ai_current_indices_state = gr.State([])
+        ai_current_choices_state = gr.State([])
+        ai_pool_indices_state = gr.State([])
+        with gr.Column(elem_id="db-panel"):
+            gr.Markdown("## AI 辅助选题")
+            gr.Markdown(
+                "输入自然语言需求，例如“选择脊椎动物学的题目，50题”或“脊椎动物 骨骼相关题目”。"
+                "AI 只负责拆解为 count + AND/OR 关键词逻辑树；随后由固定程序检索候选题。"
+                "你可以人工取消不想保留的候选题，再加入总备选池；可多次 AI 选题、多轮人工筛选，最后导出总备选。"
+            )
+            with gr.Row(elem_id="db-controls"):
+                ai_select_request = gr.Textbox(
+                    label="选题需求",
+                    value="选择脊椎动物学的题目，50题",
+                    lines=3,
+                    scale=5,
+                )
+                ai_default_count = gr.Slider(
+                    label="默认题数",
+                    minimum=5,
+                    maximum=150,
+                    value=50,
+                    step=5,
+                    scale=2,
+                )
+                ai_select_btn = gr.Button("AI 拆解需求并生成候选", variant="primary", scale=2)
+            ai_select_status = gr.Textbox(label="AI selection status", lines=6, interactive=False)
+            with gr.Row():
+                ai_keyword_plan = gr.JSON(label="Parsed keyword plan")
+                ai_raw_plan = gr.Textbox(label="Raw AI planning output", lines=12)
+
+            gr.Markdown("### Current AI candidates：本轮 AI 候选")
+            ai_current_table = gr.Dataframe(
+                headers=["selected #", "id", "stem", "options", "answer", "remark", "image"],
+                datatype=["number", "number", "str", "str", "str", "str", "str"],
+                interactive=False,
+                wrap=False,
+                elem_id="ai-current-table",
+            )
+            ai_current_checks = gr.CheckboxGroup(
+                label="AI current candidates: uncheck questions to discard before adding to total pool",
+                choices=[],
+                value=[],
+            )
+            with gr.Row():
+                ai_select_all_current_btn = gr.Button("Select all current candidates", scale=1)
+                ai_clear_current_checks_btn = gr.Button("Clear current checks", scale=1)
+                ai_add_checked_to_pool_btn = gr.Button("Add checked to total pool", variant="primary", scale=2)
+                ai_discard_current_btn = gr.Button("Discard current batch", scale=1)
+
+            gr.Markdown("### Total pool：总备选池")
+            ai_pool_status = gr.Textbox(
+                label="Total pool status",
+                value="总备选池为空。可以多次 AI 选题，将人工保留的题目加入这里，最后统一导出。",
+                lines=2,
+                interactive=False,
+            )
+            ai_pool_table = gr.Dataframe(
+                headers=["selected #", "id", "stem", "options", "answer", "remark", "image"],
+                datatype=["number", "number", "str", "str", "str", "str", "str"],
+                interactive=False,
+                wrap=False,
+                elem_id="ai-pool-table",
+            )
+            ai_pool_remove_checks = gr.CheckboxGroup(
+                label="Total pool: check questions to remove",
+                choices=[],
+                value=[],
+            )
+            with gr.Row():
+                ai_remove_from_pool_btn = gr.Button("Remove checked from total pool", scale=2)
+                ai_clear_pool_btn = gr.Button("Clear total pool", scale=1)
+                ai_export_pool_btn = gr.Button("Export total pool to Word", variant="primary", scale=2)
+            with gr.Row():
+                ai_export_status = gr.Textbox(label="AI export status", interactive=False, scale=3)
+                ai_export_file = gr.File(label="Exported Word file", scale=2)
+
 
     nav_entry_btn.click(
         fn=show_entry_view,
         inputs=[],
-        outputs=[entry_view, db_view, nav_status],
+        outputs=[entry_view, db_view, ai_select_view, nav_status],
     )
 
     nav_db_btn.click(
         fn=show_db_view,
         inputs=[],
-        outputs=[entry_view, db_view, nav_status],
+        outputs=[entry_view, db_view, ai_select_view, nav_status],
+    )
+
+    nav_ai_select_btn.click(
+        fn=show_ai_select_view,
+        inputs=[],
+        outputs=[entry_view, db_view, ai_select_view, nav_status],
     )
 
     backend_mode.change(
         fn=update_backend_visibility,
         inputs=[backend_mode],
         outputs=[local_backend_group, api_backend_group, backend_hint],
+    )
+
+    load_api_profile_btn.click(
+        fn=load_api_profile,
+        inputs=[api_profile_dropdown],
+        outputs=[api_region, api_base_url, api_model_name, api_key, save_api_key, api_cache_status],
+    )
+
+    delete_api_profile_btn.click(
+        fn=delete_api_profile,
+        inputs=[api_profile_dropdown],
+        outputs=[api_profile_dropdown, api_cache_status],
+    )
+
+    test_save_api_profile_btn.click(
+        fn=test_api_and_save_profile,
+        inputs=[api_region, api_base_url, api_model_name, api_key, save_api_key],
+        outputs=[api_profile_dropdown, api_cache_status],
     )
 
     refresh_models_btn.click(
@@ -2155,6 +2913,86 @@ with gr.Blocks(title="Local Qwen-VL Quiz Builder - llama-server checked") as dem
             parsed_json,
             json_preview,
         ],
+    )
+
+    ai_select_btn.click(
+        fn=ai_plan_and_select_questions,
+        inputs=[
+            ai_select_request,
+            ai_default_count,
+            backend_mode,
+            api_region,
+            api_base_url,
+            api_model_name,
+            api_key,
+            server_url,
+            model_name,
+            llama_server_exe,
+            local_model_path,
+            local_mmproj_path,
+            llama_ctx_size,
+            llama_threads,
+            system_prompt,
+            temperature,
+            top_p,
+        ],
+        outputs=[
+            ai_select_status,
+            ai_keyword_plan,
+            ai_raw_plan,
+            ai_current_table,
+            ai_current_indices_state,
+            ai_current_checks,
+            ai_current_choices_state,
+        ],
+    )
+
+    ai_select_all_current_btn.click(
+        fn=select_all_search_results,
+        inputs=[ai_current_choices_state],
+        outputs=[ai_current_checks, ai_select_status],
+    )
+
+    ai_clear_current_checks_btn.click(
+        fn=clear_search_checks,
+        inputs=[],
+        outputs=[ai_current_checks, ai_select_status],
+    )
+
+    ai_discard_current_btn.click(
+        fn=discard_current_ai_candidates,
+        inputs=[],
+        outputs=[
+            ai_current_indices_state,
+            ai_current_table,
+            ai_current_checks,
+            ai_current_choices_state,
+            ai_select_status,
+        ],
+    )
+
+    ai_add_checked_to_pool_btn.click(
+        fn=add_current_ai_checked_to_pool,
+        inputs=[ai_current_checks, ai_pool_indices_state],
+        outputs=[ai_pool_indices_state, ai_pool_table, ai_pool_remove_checks, ai_pool_status],
+    )
+
+    ai_remove_from_pool_btn.click(
+        fn=remove_checked_from_ai_pool,
+        inputs=[ai_pool_remove_checks, ai_pool_indices_state],
+        outputs=[ai_pool_indices_state, ai_pool_table, ai_pool_remove_checks, ai_pool_status],
+    )
+
+    ai_clear_pool_btn.click(
+        fn=clear_ai_pool,
+        inputs=[],
+        outputs=[ai_pool_indices_state, ai_pool_table, ai_pool_remove_checks, ai_pool_status],
+    )
+
+    ai_export_pool_btn.click(
+        fn=export_selected_word,
+        inputs=[ai_pool_indices_state],
+        outputs=[ai_export_status, ai_export_file],
     )
 
     preview_btn.click(
